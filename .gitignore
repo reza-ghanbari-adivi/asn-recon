@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+provider-config.yaml
+
+# Scan results and temporary data
+reports/*
+!reports/.gitkeep
+state/*
+!state/.gitkeep
+
+# Local configuration containing authorized targets
+config/approved_cidrs.txt
+config/approved_domains.txt
+config/approved_external_ips.txt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+*.zip
+
+*.review.csv

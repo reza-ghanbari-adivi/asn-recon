@@ -1,0 +1,3 @@
+Hostname,IP,Record_type,In_ASN_scope,In_external_allowlist,Source
+app.example.test,192.0.2.12,A,yes,no,fixture
+assets.example.test,198.51.100.7,A,no,no,fixture
