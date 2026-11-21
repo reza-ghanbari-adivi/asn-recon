@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+import dns.exception
 import dns.resolver
 import dns.reversename
 import tldextract
@@ -55,7 +56,7 @@ SCAN_COLUMNS = [
 
 MAP_COLUMNS = [
     "Hostname", "IP", "Record_type", "In_ASN_scope",
-    "In_external_allowlist", "Source",
+    "Source",
 ]
 
 EXTERNAL_COLUMNS = [
@@ -650,9 +651,6 @@ def resolve_host(name):
 def map_names(names, asn_networks):
     print(f"\n[+] Resolving {len(names)} hostname(s)...")
 
-    external_allowlist = load_networks(
-        CONFIG / "approved_external_ips.txt"
-    )
 
     mapped = []
 
@@ -672,20 +670,46 @@ def map_names(names, asn_networks):
                     "Record_type": record_type,
                     "In_ASN_scope":
                         "yes" if inside(ip, asn_networks) else "no",
-                    "In_external_allowlist":
-                        "yes" if inside(ip, external_allowlist) else "no",
                     "Source": "; ".join(sorted(names[name])),
                 })
 
     mapped.sort(key=lambda row: (row["Hostname"], row["IP"]))
 
     print(f"[+] Resolved {len(mapped)} DNS record(s).")
-    print(
-        "[+] External allowlisted records: "
-        f"{sum(r['In_external_allowlist'] == 'yes' for r in mapped)}"
-    )
 
     return mapped
+
+
+def other_asn_rows(mapped, target_asn, discovered_networks):
+    result = []
+    origins = {}
+    for row in mapped:
+        ip = row["IP"]
+        addr = ipaddress.ip_address(ip)
+        if not addr.is_global or inside(ip, discovered_networks):
+            continue
+        if ip not in origins:
+            origins[ip] = None
+            suffix = "in-addr.arpa" if addr.version == 4 else "ip6.arpa"
+            zone = "origin.asn.cymru.com." if addr.version == 4 else "origin6.asn.cymru.com."
+            query = addr.reverse_pointer[:-len(suffix)] + zone
+            try:
+                answers = dns.resolver.resolve(query, "TXT", lifetime=4)
+                numbers = {
+                    number
+                    for answer in answers
+                    for number in b"".join(answer.strings).decode("ascii").split("|")[0].split()
+                }
+                if len(numbers) == 1:
+                    number = next(iter(numbers))
+                    if number.isdecimal() and int(number) > 0:
+                        origins[ip] = f"AS{int(number)}"
+            except (dns.exception.DNSException, UnicodeError):
+                pass
+        origin = origins[ip]
+        if origin is not None and int(origin[2:]) != int(target_asn[2:]):
+            result.append({"Hostname": row["Hostname"], "IP": ip, "Origin_ASN": origin})
+    return result
 
 
 def external_scan(mapped, port_options, tag, asn_networks):
@@ -711,7 +735,7 @@ def external_scan(mapped, port_options, tag, asn_networks):
         return []
 
     print("\n[!] External infrastructure candidates:")
-    for ip in sorted(discovered, key=ipaddress.ip_address):
+    for ip in sorted(discovered, key=lambda ip: (ipaddress.ip_address(ip).version, int(ipaddress.ip_address(ip)))):
         print(f"    {ip}")
 
     print(
@@ -782,6 +806,26 @@ def write_csv(path, columns, rows):
     print(f"[+] Saved: {path}")
 
 
+def review_other_origins(mappings, asn, networks, tag):
+    findings = other_asn_rows(mappings, asn, networks)
+    if not findings:
+        print("[+] No confirmed different-origin mappings. No review needed.")
+        return
+
+    print("\\nHostnames with a confirmed different routing ASN:")
+    for row in findings:
+        print(f"  {row['Hostname']} -> {row['IP']} ({row['Origin_ASN']})")
+    try:
+        answer = input("Save these findings to a separate review CSV? [y/N]: ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() != "y":
+        print("Skipped. The primary reports are unchanged.")
+        return
+    write_csv(REPORTS / f"external_origin_review_{tag}.csv",
+              ["Hostname", "IP", "Origin_ASN"], findings)
+
+
 def main():
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(
@@ -805,7 +849,7 @@ def main():
     if not 1 <= args.rate <= 10000:
         fail("Naabu rate must be between 1 and 10000.")
 
-    for directory in (CONFIG, STATE, REPORTS):
+    for directory in (STATE, REPORTS):
         directory.mkdir(parents=True, exist_ok=True)
 
     for program in ("asnmap", "naabu", "nmap", "subfinder"):
@@ -823,12 +867,22 @@ def main():
 
     print("\n=== Authorized ASN Reconnaissance ===")
 
-    discovered = lookup_asn(asn)
-    networks = approve_asn_networks(discovered)
 
+    networks = lookup_asn(asn)
     check_scope_size(networks)
+    print(f"\nInitial inventory for {asn}:")
+    for network in networks:
+        print(f"  {network}")
+    print(f"Addresses across listed prefixes: {sum(n.num_addresses for n in networks)}")
+    try:
+        answer = input("Authorized to inventory ALL listed prefixes? [y/N]: ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() != "y":
+        print("Cancelled. No port scan started.")
+        return
 
-    port_options = choose_ports()
+    port_options = ["-top-ports", "1000"]
 
     endpoints = naabu_scan(
         networks,
@@ -848,10 +902,7 @@ def main():
 
     print(f"\n[+] Candidate apex domains: {candidates}")
 
-    approved_domains = (
-        approve_domains(candidates)
-        if candidates else []
-    )
+    approved_domains = candidates  # Passive enumeration and DNS mapping only.
 
     observed = defaultdict(set)
 
@@ -888,23 +939,10 @@ def main():
         mappings,
     )
 
-    # External scanning is a separate, optional operation.
-    external_rows = external_scan(
-        mappings,
-        port_options,
-        tag,
-        networks,
-    )
 
-    if external_rows:
-        write_csv(
-            REPORTS / f"external_scan_report_{tag}.csv",
-            EXTERNAL_COLUMNS,
-            external_rows,
-        )
-
-    print("\n[+] Reconnaissance completed.")
-    print("[+] ASN and external scan reports are kept separate.")
+    print("\n[+] Initial inventory and hostname enumeration finished. Primary reports saved.")
+    review_other_origins(mappings, asn, networks, tag)
+    print("[+] Done. No external IP or second ASN was scanned.")
 
 
 if __name__ == "__main__":
